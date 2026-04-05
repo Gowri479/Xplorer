@@ -1,11 +1,15 @@
 import 'dart:io';
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'dart:typed_data';
 import 'package:image_picker/image_picker.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:image/image.dart' as img;
 import 'package:volume_controller/volume_controller.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 void main() {
   runApp(const CurrencyApp());
@@ -32,12 +36,15 @@ class CurrencyHome extends StatefulWidget {
 
 class _CurrencyHomeState extends State<CurrencyHome> {
   // ==================== CONSTANTS ====================
-  static const int modelInputSize = 224;
-  static const int numClasses = 6;
-  static const double confidenceThreshold = 0.8;
+  static const int modelInputSize = 640;
   static const double ttsSpeechRate = 0.5;
   static const String ttsLanguage = "en-IN";
-  
+
+  // BLE Constants (must match Arduino code)
+  static const String deviceName = "Umbrella_Locator";
+  static const String serviceUuid = "12345678-1234-1234-1234-123456789abc";
+  static const String characteristicUuid = "abcd1234-5678-1234-5678-abcdef123456";
+
   // ==================== STATE VARIABLES ====================
   double lastVolume = 0.5;
   bool _isInitialized = false;
@@ -45,15 +52,18 @@ class _CurrencyHomeState extends State<CurrencyHome> {
   Interpreter? interpreter;
   final picker = ImagePicker();
   final FlutterTts tts = FlutterTts();
- 
   final VolumeController volumeController = VolumeController.instance;
-  
-  // Processing flag to prevent multiple rapid triggers
+
+  // BLE related
+  BluetoothDevice? _bleDevice;
+  bool _isConnecting = false;
+  bool _isConnected = false;
+  Timer? _buzzerOffTimer;
+  StreamSubscription<BluetoothConnectionState>? _connectionSubscription;
+
+  // Processing flag
   bool _isProcessingVolume = false;
-  
-  // Labels will be loaded from file
-  List<String> labels = [];
-  
+
   String lastResult = "No currency detected";
   double lastConfidence = 0.0;
 
@@ -66,254 +76,355 @@ class _CurrencyHomeState extends State<CurrencyHome> {
   // ==================== INITIALIZATION ====================
   Future<void> _initializeApp() async {
     await loadModel();
-    await speak("Currency detector ready. Press volume up to scan note.");
-    
-    // Initialize volume controller
+    await _requestPermissions();
+    await _initBle();
+    await speak("Currency detector ready. Press volume up to scan note. Volume down activates buzzer.");
+
     volumeController.showSystemUI = false;
-    
-    // Get initial volume to prevent immediate trigger
     lastVolume = await volumeController.getVolume();
 
-    // Listener for volume buttons
     volumeController.addListener((double volume) async {
       if (!_isInitialized || !mounted || _isProcessingVolume) return;
-      
       _isProcessingVolume = true;
-      
       try {
         double currentVolume = volume;
-        
         if (currentVolume > lastVolume) {
-          // Volume UP pressed - Scan currency
           await scanCurrency();
         } else if (currentVolume < lastVolume) {
-          // Volume DOWN pressed - Repeat last result
-          await speak(lastResult);
+          await _activateBuzzer();
         }
-
         lastVolume = currentVolume;
       } finally {
         _isProcessingVolume = false;
       }
     });
-    
+
     _isInitialized = true;
   }
 
-  // ==================== LOAD HIGH ACCURACY MODEL ====================
-  Future<void> loadModel() async {
-    try {
-      // Load the new 99.8% accuracy model
-      interpreter = await Interpreter.fromAsset('assets/currency_model_99.8.tflite');
-      
-      // Load labels for the model
-      final String labelsText = await rootBundle.loadString('assets/labels_new.txt');
-      labels = labelsText
-          .split('\n')
-          .where((line) => line.trim().isNotEmpty)
-          .map((line) => line.trim())
-          .toList();
-      
-      final inputShape = interpreter!.getInputTensor(0).shape;
-      final outputShape = interpreter!.getOutputTensor(0).shape;
-      
-      debugPrint("✅ HIGH ACCURACY MODEL LOADED SUCCESSFULLY!");
-      debugPrint("📊 Input shape: $inputShape");
-      debugPrint("📊 Output shape: $outputShape");
-      debugPrint("📊 Labels: $labels");
-      
-      await speak("High accuracy model loaded successfully");
-      
-    } catch (e) {
-      debugPrint("❌ Model failed to load: $e");
-      await speak("Model loading failed. Please restart app.");
-      
-      // Show error to user
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text("Failed to load AI model. Check assets."),
-            backgroundColor: Colors.red,
-          ),
-        );
-      }
+  // ==================== PERMISSIONS ====================
+  Future<void> _requestPermissions() async {
+    if (Platform.isAndroid) {
+      await [
+        Permission.bluetooth,
+        Permission.bluetoothScan,
+        Permission.bluetoothConnect,
+        Permission.locationWhenInUse,
+      ].request();
+    } else if (Platform.isIOS) {
+      await Permission.bluetooth.request();
     }
   }
 
-  // ==================== SCAN CURRENCY USING CAMERA ====================
+  // ==================== BLE INITIALIZATION ====================
+  Future<void> _initBle() async {
+    if (Platform.isAndroid) {
+      await FlutterBluePlus.turnOn();
+    }
+  }
+
+  // ==================== CONNECT TO ESP32 AND SEND "ON" ====================
+  Future<void> _activateBuzzer() async {
+    if (_isConnecting) {
+      await speak("Already connecting, please wait");
+      return;
+    }
+
+    _buzzerOffTimer?.cancel();
+
+    if (_isConnected && _bleDevice != null) {
+      await _sendBleCommand("ON");
+      _buzzerOffTimer = Timer(const Duration(seconds: 2), () {
+        _sendBleCommand("OFF");
+      });
+      return;
+    }
+
+    setState(() { _isConnecting = true; });
+    await speak("Connecting to buzzer");
+
+    try {
+      await FlutterBluePlus.startScan(timeout: const Duration(seconds: 5));
+
+      BluetoothDevice? targetDevice;
+      bool deviceFound = false;
+
+      await for (var scanResults in FlutterBluePlus.scanResults) {
+        for (ScanResult result in scanResults) {
+          if (result.device.platformName == deviceName) {
+            targetDevice = result.device;
+            deviceFound = true;
+            break;
+          }
+        }
+        if (deviceFound) break;
+      }
+
+      await FlutterBluePlus.stopScan();
+
+      if (targetDevice == null) {
+        await speak("Buzzer device not found. Make sure ESP32 is powered on.");
+        setState(() { _isConnecting = false; });
+        return;
+      }
+
+      _connectionSubscription = targetDevice.connectionState.listen((state) {
+        if (mounted) {
+          setState(() {
+            if (state == BluetoothConnectionState.connected) {
+              _isConnected = true;
+              _bleDevice = targetDevice;
+              debugPrint("✅ Connected to ${targetDevice!.platformName}");
+            } else if (state == BluetoothConnectionState.disconnected) {
+              _isConnected = false;
+              _bleDevice = null;
+              debugPrint("❌ Disconnected");
+            }
+          });
+        }
+      });
+
+      await targetDevice.connect();
+      await targetDevice.discoverServices();
+
+      setState(() {
+        _bleDevice = targetDevice;
+        _isConnected = true;
+        _isConnecting = false;
+      });
+
+      await speak("Connected to buzzer");
+      await _sendBleCommand("ON");
+
+      _buzzerOffTimer = Timer(const Duration(seconds: 2), () {
+        _sendBleCommand("OFF");
+      });
+
+    } catch (e) {
+      debugPrint("BLE connection error: $e");
+      await speak("Failed to connect to buzzer");
+      setState(() { _isConnecting = false; });
+    }
+  }
+
+  // ==================== SEND BLE COMMAND ====================
+  Future<void> _sendBleCommand(String command) async {
+    if (_bleDevice == null) {
+      debugPrint("No BLE device");
+      return;
+    }
+    try {
+      BluetoothCharacteristic? targetChar;
+      for (var service in _bleDevice!.servicesList) {
+        if (service.uuid.toString().toLowerCase() == serviceUuid.toLowerCase()) {
+          for (var char in service.characteristics) {
+            if (char.uuid.toString().toLowerCase() == characteristicUuid.toLowerCase()) {
+              targetChar = char;
+              break;
+            }
+          }
+        }
+      }
+
+      if (targetChar == null) {
+        debugPrint("Characteristic not found");
+        await speak("Buzzer service error");
+        return;
+      }
+
+      await targetChar.write(command.codeUnits, withoutResponse: false);
+      debugPrint("BLE command '$command' sent");
+    } catch (e) {
+      debugPrint("Error sending BLE command: $e");
+    }
+  }
+
+  // ==================== LOAD MODEL ====================
+  Future<void> loadModel() async {
+    try {
+      // CPU only — avoids GPU/NNAPI delegate crashes on most Android devices
+      final options = InterpreterOptions()..threads = 4;
+      interpreter = await Interpreter.fromAsset(
+        'assets/final_model.tflite',
+        options: options,
+      );
+      debugPrint("✅ Model loaded!");
+      debugPrint("Input shape:  ${interpreter!.getInputTensor(0).shape}");
+      debugPrint("Output shape: ${interpreter!.getOutputTensor(0).shape}");
+    } catch (e) {
+      debugPrint("❌ Load failed: $e");
+      await speak("Model loading failed");
+    }
+  }
+
+  // ==================== SCAN CURRENCY ====================
   Future<void> scanCurrency() async {
     if (_isScanning) {
       await speak("Already scanning, please wait");
       return;
     }
-    
-    setState(() {
-      _isScanning = true;
-    });
-
+    setState(() { _isScanning = true; });
     try {
       await speak("Scanning currency note");
-
       final XFile? image = await picker.pickImage(
         source: ImageSource.camera,
         maxWidth: modelInputSize * 2,
         maxHeight: modelInputSize * 2,
         imageQuality: 90,
       );
-
       if (image == null) {
         setState(() { _isScanning = false; });
         return;
       }
-
       final result = await predictCurrency(File(image.path));
-      
       setState(() {
         lastResult = result.message;
         lastConfidence = result.confidence;
       });
-      
       await speak(result.message);
-      
       debugPrint("✅ Detection: ${result.message} (${(result.confidence * 100).toStringAsFixed(1)}%)");
-      
     } catch (e) {
       debugPrint("❌ Scan error: $e");
       await speak("Scanning failed, please try again");
     } finally {
-      if (mounted) {
-        setState(() { _isScanning = false; });
-      }
+      if (mounted) setState(() { _isScanning = false; });
     }
   }
 
-  // ==================== PREDICT CURRENCY DENOMINATION ====================
+  // ==================== PREDICT ====================
   Future<DetectionResult> predictCurrency(File imageFile) async {
     if (interpreter == null) {
-      return DetectionResult(
-        "Model not loaded", 
-        0.0, 
-        -1, 
-        "Error: Model not loaded"
-      );
+      return DetectionResult("Model not loaded", 0.0, -1, "Error");
     }
-
     try {
+      // 1. Decode image
       final imageBytes = await imageFile.readAsBytes();
       final decodedImage = img.decodeImage(imageBytes);
-      
       if (decodedImage == null) {
-        return DetectionResult(
-          "Failed to decode image", 
-          0.0, 
-          -1, 
-          "Image decoding failed"
-        );
+        return DetectionResult("Failed to decode image", 0.0, -1, "Error");
       }
 
-      img.Image resized = img.copyResize(
-        decodedImage, 
-        width: modelInputSize, 
-        height: modelInputSize
-      );
+      // 2. Resize to 640x640 — matches Python: Image.open().resize((640, 640))
+      const int inputSize = 640;
+      final resized = img.copyResize(decodedImage, width: inputSize, height: inputSize);
 
-      var input = List.generate(
-        1,
-        (_) => List.generate(
-          modelInputSize,
-          (_) => List.generate(
-            modelInputSize, 
-            (_) => List.generate(3, (_) => 0.0)
-          )
-        )
-      );
-
-      for (int y = 0; y < modelInputSize; y++) {
-        for (int x = 0; x < modelInputSize; x++) {
-          final pixel = resized.getPixel(x, y);
-          input[0][y][x][0] = pixel.r / 255.0;
-          input[0][y][x][1] = pixel.g / 255.0;
-          input[0][y][x][2] = pixel.b / 255.0;
+      // 3. Build input buffer in CHW order [1, 3, 640, 640]
+      //    Matches Python: np.transpose(input_data, (2, 0, 1)) → CHW
+      final inputBuffer = Float32List(1 * 3 * inputSize * inputSize);
+      int idx = 0;
+      for (int c = 0; c < 3; c++) {
+        for (int y = 0; y < inputSize; y++) {
+          for (int x = 0; x < inputSize; x++) {
+            final pixel = resized.getPixel(x, y);
+            // Matches Python: input_data / 255.0
+            inputBuffer[idx++] = (c == 0
+                ? pixel.r
+                : c == 1
+                    ? pixel.g
+                    : pixel.b) /
+                255.0;
+          }
         }
       }
 
-      var output = List.filled(numClasses, 0.0).reshape([1, numClasses]);
-      
+      // 4. Read output tensor shape dynamically
+      //    Python confirms shape is [1, 12, 8400] → numChannels=12, numPredictions=8400
+      final outputShape = interpreter!.getOutputTensor(0).shape;
+      debugPrint("Output shape: $outputShape");
+
+      if (outputShape.length != 3) {
+        return DetectionResult("Unexpected output shape", 0.0, -1, "Error");
+      }
+
+      final int numChannels    = outputShape[1]; // 12  (4 bbox + 8 classes)
+      final int numPredictions = outputShape[2]; // 8400
+      final int numClasses     = numChannels - 4; // 8
+
+      // 5. Allocate output buffer and run inference
+      //    IMPORTANT: reshape input to match [1, 3, 640, 640] as nested structure
+      //    tflite_flutter accepts Float32List directly when shapes match
+      final outputBuffer = Float32List(1 * numChannels * numPredictions);
+
+      interpreter!.run(inputBuffer.buffer, outputBuffer.buffer);
+
       final startTime = DateTime.now().millisecondsSinceEpoch;
-      interpreter!.run(input, output);
       final inferenceTime = DateTime.now().millisecondsSinceEpoch - startTime;
 
-      List<double> probabilities = output[0].cast<double>();
-      
-      double maxConfidence = probabilities.reduce((a, b) => a > b ? a : b);
-      int predictedIndex = probabilities.indexOf(maxConfidence);
-      
-      // Get denomination from loaded labels
-      String denomination = predictedIndex >= 0 && predictedIndex < labels.length 
-          ? labels[predictedIndex] 
-          : "Unknown";
-      
-      // Generate spoken message based on denomination
-      String spokenMessage;
-      if (maxConfidence < 0.6) {
-        spokenMessage = "I'm not sure, please try again with better lighting";
-      } else if (maxConfidence < confidenceThreshold) {
-        spokenMessage = "I think this is ₹$denomination";
-      } else {
-        // Handle different denomination spoken formats
-        switch (denomination) {
-          case "2000":
-            spokenMessage = "Two thousand rupees detected";
-            break;
-          case "500":
-            spokenMessage = "Five hundred rupees detected";
-            break;
-          case "200":
-            spokenMessage = "Two hundred rupees detected";
-            break;
-          case "100":
-            spokenMessage = "One hundred rupees detected";
-            break;
-          case "50":
-            spokenMessage = "Fifty rupees detected";
-            break;
-          case "20":
-            spokenMessage = "Twenty rupees detected";
-            break;
-          case "10":
-            spokenMessage = "Ten rupees detected";
-            break;
-          default:
-            spokenMessage = "₹$denomination rupees detected";
+      // 6. Parse detections — mirrors Python logic:
+      //    preds = output[0].T  →  iterate i across 8400, c across classes
+      //    score = pred[4 + c]  →  output[(4+c) * numPredictions + i]
+      double bestConfidence = 0.0;
+      int bestClassIndex = -1;
+      const double detectionThreshold = 0.2; // same as Python: if conf > 0.2
+
+      for (int i = 0; i < numPredictions; i++) {
+        double maxScore = 0.0;
+        int maxClass = -1;
+
+        for (int c = 0; c < numClasses; c++) {
+          final double score = outputBuffer[(4 + c) * numPredictions + i];
+          if (score > maxScore) {
+            maxScore = score;
+            maxClass = c;
+          }
+        }
+
+        if (maxScore > detectionThreshold && maxScore > bestConfidence) {
+          bestConfidence = maxScore;
+          bestClassIndex = maxClass;
         }
       }
 
-      debugPrint("\n📊 Prediction Results (Inference: ${inferenceTime}ms):");
-      debugPrint("   Using HIGH ACCURACY MODEL (99.8%)");
-      for (int i = 0; i < probabilities.length; i++) {
-        String label = i < labels.length ? labels[i] : "Class $i";
-        debugPrint("   ₹$label: ${(probabilities[i] * 100).toStringAsFixed(1)}%");
+      // 7. Class names — must match Python CLASSES list order exactly:
+      //    ["₹10","₹20","₹50","₹100","₹200","₹500","₹2000","not_currency"]
+      const List<String> classNames = [
+        "10", "20", "50", "100", "200", "500", "2000", "not_currency"
+      ];
+
+      final String denomination = (bestClassIndex >= 0 && bestClassIndex < classNames.length)
+          ? classNames[bestClassIndex]
+          : "unknown";
+
+      // 8. Spoken message — mirrors Python confidence check logic
+      String spokenMessage;
+      if (bestClassIndex < 0 || bestClassIndex >= classNames.length) {
+        // Nothing passed detectionThreshold — same as Python "No currency detected"
+        spokenMessage = "No currency detected";
+      } else if (bestClassIndex == classNames.length - 1) {
+        // Last class is not_currency (index 7)
+        spokenMessage = "This does not appear to be a currency note";
+      } else if (bestConfidence > 0.8) {
+        switch (denomination) {
+          case "2000": spokenMessage = "Two thousand rupees detected"; break;
+          case "500":  spokenMessage = "Five hundred rupees detected"; break;
+          case "200":  spokenMessage = "Two hundred rupees detected"; break;
+          case "100":  spokenMessage = "One hundred rupees detected"; break;
+          case "50":   spokenMessage = "Fifty rupees detected"; break;
+          case "20":   spokenMessage = "Twenty rupees detected"; break;
+          case "10":   spokenMessage = "Ten rupees detected"; break;
+          default:     spokenMessage = "₹$denomination detected";
+        }
+      } else if (bestConfidence > 0.6) {
+        spokenMessage = "I think this is ₹$denomination";
+      } else {
+        spokenMessage = "Please try again with better lighting";
       }
-      debugPrint("🎯 Selected: ₹$denomination (${(maxConfidence * 100).toStringAsFixed(1)}%)\n");
+
+      debugPrint("📊 Prediction (${inferenceTime}ms): $denomination "
+          "${(bestConfidence * 100).toStringAsFixed(1)}%");
 
       return DetectionResult(
         spokenMessage,
-        maxConfidence,
-        predictedIndex,
+        bestConfidence,
+        bestClassIndex,
         denomination,
         inferenceTime: inferenceTime,
-        allProbabilities: probabilities,
       );
 
     } catch (e) {
       debugPrint("❌ Prediction error: $e");
-      return DetectionResult(
-        "Error detecting currency", 
-        0.0, 
-        -1, 
-        "Error",
-        errorMessage: e.toString()
-      );
+      return DetectionResult("Error detecting currency", 0.0, -1, "Error",
+          errorMessage: e.toString());
     }
   }
 
@@ -333,39 +444,23 @@ class _CurrencyHomeState extends State<CurrencyHome> {
   // ==================== CLEANUP ====================
   @override
   void dispose() {
-    try {
-      volumeController.removeListener();
-    } catch (e) {
-      debugPrint("Error removing volume listener: $e");
-    }
-    
-    try {
-      interpreter?.close();
-    } catch (e) {
-      debugPrint("Error closing interpreter: $e");
-    }
-    
-    try {
-      tts.stop();
-    } catch (e) {
-      debugPrint("Error stopping TTS: $e");
-    }
-    
+    _buzzerOffTimer?.cancel();
+    _connectionSubscription?.cancel();
+    volumeController.removeListener();
+    interpreter?.close();
+    tts.stop();
     super.dispose();
   }
 
-  // ==================== UI BUILD ====================
+  // ==================== UI ====================
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text(
-          "Currency Identifier",
-          style: TextStyle(fontWeight: FontWeight.bold),
-        ),
+        title: const Text("Currency Identifier",
+            style: TextStyle(fontWeight: FontWeight.bold)),
         backgroundColor: Colors.green,
         foregroundColor: Colors.white,
-        elevation: 0,
       ),
       body: Container(
         decoration: BoxDecoration(
@@ -384,17 +479,11 @@ class _CurrencyHomeState extends State<CurrencyHome> {
                 Container(
                   padding: const EdgeInsets.all(20),
                   decoration: BoxDecoration(
-                    color: Colors.green.shade100,
-                    shape: BoxShape.circle,
-                  ),
-                  child: const Icon(
-                    Icons.currency_rupee,
-                    size: 64,
-                    color: Colors.green,
-                  ),
+                      color: Colors.green.shade100, shape: BoxShape.circle),
+                  child: const Icon(Icons.currency_rupee,
+                      size: 64, color: Colors.green),
                 ),
                 const SizedBox(height: 40),
-                
                 Container(
                   padding: const EdgeInsets.all(20),
                   decoration: BoxDecoration(
@@ -402,39 +491,51 @@ class _CurrencyHomeState extends State<CurrencyHome> {
                     borderRadius: BorderRadius.circular(16),
                     boxShadow: [
                       BoxShadow(
-                        color: Colors.grey.withValues(alpha: 0.2),
-                        spreadRadius: 2,
-                        blurRadius: 8,
-                        offset: const Offset(0, 2),
-                      ),
+                          color: Colors.grey.withValues(alpha: 0.2),
+                          spreadRadius: 2,
+                          blurRadius: 8)
                     ],
                   ),
                   child: Column(
                     children: [
-                      const Text(
-                        "Volume Controls",
-                        style: TextStyle(
-                          fontSize: 20,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
+                      const Text("Volume Controls",
+                          style: TextStyle(
+                              fontSize: 20, fontWeight: FontWeight.bold)),
                       const SizedBox(height: 16),
-                      _buildInstructionRow(
-                        Icons.volume_up,
-                        "Press Volume Up",
-                        "Scan currency note",
-                      ),
+                      _buildInstructionRow(Icons.volume_up, "Press Volume Up",
+                          "Scan currency note"),
                       const Divider(height: 24),
-                      _buildInstructionRow(
-                        Icons.volume_down,
-                        "Press Volume Down",
-                        "Repeat last result",
-                      ),
+                      _buildInstructionRow(Icons.volume_down,
+                          "Press Volume Down", "Activate buzzer (BLE)"),
                     ],
                   ),
                 ),
                 const SizedBox(height: 20),
-                
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: _isConnected
+                        ? Colors.green.shade100
+                        : Colors.grey.shade200,
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Row(mainAxisSize: MainAxisSize.min, children: [
+                    Icon(Icons.bluetooth,
+                        size: 16,
+                        color: _isConnected ? Colors.green : Colors.grey),
+                    const SizedBox(width: 4),
+                    Text(
+                      _isConnected
+                          ? "Buzzer Connected"
+                          : "Buzzer Not Connected",
+                      style: TextStyle(
+                          fontSize: 12,
+                          color: _isConnected ? Colors.green : Colors.grey),
+                    ),
+                  ]),
+                ),
+                const SizedBox(height: 20),
                 if (lastResult != "No currency detected")
                   Container(
                     padding: const EdgeInsets.all(16),
@@ -443,73 +544,50 @@ class _CurrencyHomeState extends State<CurrencyHome> {
                       borderRadius: BorderRadius.circular(12),
                       border: Border.all(color: Colors.green.shade200),
                     ),
-                    child: Column(
-                      children: [
-                        const Text(
-                          "Last Detection",
-                          style: TextStyle(
-                            fontSize: 14,
-                            color: Colors.grey,
-                          ),
-                        ),
-                        const SizedBox(height: 8),
-                        Text(
-                          lastResult,
+                    child: Column(children: [
+                      const Text("Last Detection",
+                          style:
+                              TextStyle(fontSize: 14, color: Colors.grey)),
+                      const SizedBox(height: 8),
+                      Text(lastResult,
                           style: const TextStyle(
-                            fontSize: 18,
-                            fontWeight: FontWeight.bold,
-                            color: Colors.green,
-                          ),
-                          textAlign: TextAlign.center,
-                        ),
-                        if (lastConfidence > 0)
-                          Padding(
-                            padding: const EdgeInsets.only(top: 4),
-                            child: Text(
-                              "${(lastConfidence * 100).toStringAsFixed(1)}% confidence",
-                              style: TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.green),
+                          textAlign: TextAlign.center),
+                      if (lastConfidence > 0)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 4),
+                          child: Text(
+                            "${(lastConfidence * 100).toStringAsFixed(1)}% confidence",
+                            style: TextStyle(
                                 fontSize: 12,
-                                color: Colors.grey.shade600,
-                              ),
-                            ),
+                                color: Colors.grey.shade600),
                           ),
-                      ],
-                    ),
+                        ),
+                    ]),
                   ),
-                
                 const SizedBox(height: 20),
-                
-                if (_isScanning)
+                if (_isScanning || _isConnecting)
                   Container(
                     padding: const EdgeInsets.symmetric(
-                      horizontal: 20,
-                      vertical: 12,
-                    ),
+                        horizontal: 20, vertical: 12),
                     decoration: BoxDecoration(
-                      color: Colors.green,
-                      borderRadius: BorderRadius.circular(30),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: const [
-                        SizedBox(
+                        color: Colors.green,
+                        borderRadius: BorderRadius.circular(30)),
+                    child: Row(mainAxisSize: MainAxisSize.min, children: [
+                      const SizedBox(
                           width: 20,
                           height: 20,
                           child: CircularProgressIndicator(
-                            color: Colors.white,
-                            strokeWidth: 2,
-                          ),
-                        ),
-                        SizedBox(width: 12),
-                        Text(
-                          "Scanning...",
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontSize: 16,
-                          ),
-                        ),
-                      ],
-                    ),
+                              color: Colors.white, strokeWidth: 2)),
+                      const SizedBox(width: 12),
+                      Text(
+                        _isConnecting ? "Connecting..." : "Scanning...",
+                        style: const TextStyle(
+                            color: Colors.white, fontSize: 16),
+                      ),
+                    ]),
                   ),
               ],
             ),
@@ -520,44 +598,27 @@ class _CurrencyHomeState extends State<CurrencyHome> {
   }
 
   Widget _buildInstructionRow(IconData icon, String title, String subtitle) {
-    return Row(
-      children: [
-        Container(
-          padding: const EdgeInsets.all(8),
-          decoration: BoxDecoration(
+    return Row(children: [
+      Container(
+        padding: const EdgeInsets.all(8),
+        decoration: BoxDecoration(
             color: Colors.green.shade100,
-            borderRadius: BorderRadius.circular(8),
-          ),
-          child: Icon(icon, color: Colors.green),
-        ),
-        const SizedBox(width: 16),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                title,
-                style: const TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.w500,
-                ),
-              ),
-              Text(
-                subtitle,
-                style: TextStyle(
-                  fontSize: 14,
-                  color: Colors.grey.shade600,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ],
-    );
+            borderRadius: BorderRadius.circular(8)),
+        child: Icon(icon, color: Colors.green),
+      ),
+      const SizedBox(width: 16),
+      Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text(title,
+            style: const TextStyle(
+                fontSize: 16, fontWeight: FontWeight.w500)),
+        Text(subtitle,
+            style: TextStyle(fontSize: 14, color: Colors.grey.shade600)),
+      ])),
+    ]);
   }
 }
 
-// ==================== DATA CLASS ====================
 class DetectionResult {
   final String message;
   final double confidence;
@@ -567,15 +628,10 @@ class DetectionResult {
   final List<double> allProbabilities;
   final String? errorMessage;
 
-  DetectionResult(
-    this.message,
-    this.confidence,
-    this.index,
-    this.denomination, {
-    this.inferenceTime = 0,
-    this.allProbabilities = const [],
-    this.errorMessage,
-  });
+  DetectionResult(this.message, this.confidence, this.index, this.denomination,
+      {this.inferenceTime = 0,
+      this.allProbabilities = const [],
+      this.errorMessage});
 
   bool get isConfident => confidence >= 0.7;
   bool get isError => errorMessage != null;

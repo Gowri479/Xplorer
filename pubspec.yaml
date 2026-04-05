@@ -30,6 +30,8 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  flutter_blue_plus: ^1.32.12
+  permission_handler: ^11.3.0  
   image_picker: ^1.0.4
   tflite_flutter: ^0.12.1
   flutter_tts: ^4.2.5
@@ -95,5 +97,5 @@ flutter:
   # see https://flutter.dev/to/font-from-package
 
   assets:
-    - assets/currency_model_99.8.tflite  # new model
-    - assets/labels_new.txt                 # new labels
+    - assets/final_model.tflite  # new model
+   
