@@ -10,6 +10,11 @@ import 'package:image/image.dart' as img;
 import 'package:volume_controller/volume_controller.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'package:camera/camera.dart'; 
+import 'package:http/http.dart' as http;
+import 'dart:convert';
+import 'camera_screen.dart';     // ← add this line at top
 
 void main() {
   runApp(const CurrencyApp());
@@ -45,6 +50,8 @@ class _CurrencyHomeState extends State<CurrencyHome> {
   static const String serviceUuid = "12345678-1234-1234-1234-123456789abc";
   static const String characteristicUuid = "abcd1234-5678-1234-5678-abcdef123456";
 
+  static const String apiUrl = "http://192.168.1.8:8000/detect"; // ← your IP
+
   // ==================== STATE VARIABLES ====================
   double lastVolume = 0.5;
   bool _isInitialized = false;
@@ -53,6 +60,10 @@ class _CurrencyHomeState extends State<CurrencyHome> {
   final picker = ImagePicker();
   final FlutterTts tts = FlutterTts();
   final VolumeController volumeController = VolumeController.instance;
+  CameraController? _cameraController;  // ← ADD
+  bool _showCamera = false;              // ← ADD
+  int _countdown = 3;                    // ← ADD
+  bool _captured = false;                // ← ADD
 
   // BLE related
   BluetoothDevice? _bleDevice;
@@ -256,41 +267,177 @@ class _CurrencyHomeState extends State<CurrencyHome> {
       await speak("Model loading failed");
     }
   }
+  //URL Launcher
 
+  Future<void> _openStreamlit() async {
+    final Uri url = Uri.parse(
+      'https://testedcurrencydetection-nzrz4dz6auuzhp8n9trp7t.streamlit.app'
+    );
+    if (!await launchUrl(url, mode: LaunchMode.externalApplication)) {
+      await speak("Could not open website");
+    }
+  }
   // ==================== SCAN CURRENCY ====================
+ /* Future<void> scanCurrency() async {
+  if (_isScanning) {
+    await speak("Already scanning, please wait");
+    return;
+  }
+  setState(() { _isScanning = true; });
+
+  try {
+    // 1. Get cameras
+    final cameras = await availableCameras();
+    if (cameras.isEmpty) {
+      await speak("No camera found");
+      setState(() { _isScanning = false; });
+      return;
+    }
+
+    // 2. Initialize camera
+    _cameraController = CameraController(
+      cameras[0],
+      ResolutionPreset.medium,
+      enableAudio: false,
+      imageFormatGroup: ImageFormatGroup.jpeg,
+    );
+    await _cameraController!.initialize();
+
+    // Auto flash
+    try {
+      await _cameraController!.setFlashMode(FlashMode.auto);
+    } catch (e) {
+      debugPrint("Flash not supported: $e");
+    }
+
+    // 3. Show camera overlay on screen
+    setState(() {
+      _showCamera = true;
+      _countdown = 3;
+      _captured = false;
+    });
+
+    // 4. Audio + countdown
+    await speak("Hold note flat under camera");
+
+    for (int i = 3; i >= 1; i--) {
+      if (!mounted) return;
+      setState(() => _countdown = i);
+      await speak("$i");
+      await Future.delayed(const Duration(milliseconds: 300));
+    }
+
+    // 5. Capture
+    if (!mounted) return;
+    setState(() => _captured = true);
+    await speak("Capturing");
+    await Future.delayed(const Duration(milliseconds: 300));
+
+    final XFile image = await _cameraController!.takePicture();
+
+    // 6. Hide camera
+    setState(() => _showCamera = false);
+    await _cameraController!.dispose();
+    _cameraController = null;
+
+    await speak("Processing");
+
+    // 7. Send to FastAPI
+    final request = http.MultipartRequest(
+      'POST', Uri.parse(apiUrl),
+    );
+    request.files.add(
+      await http.MultipartFile.fromPath('file', image.path)
+    );
+
+    final response = await request.send().timeout(
+      const Duration(seconds: 15),
+      onTimeout: () => throw Exception("Server timeout"),
+    );
+
+    final body = await response.stream.bytesToString();
+    final json = jsonDecode(body);
+
+    final message    = json['message']    ?? "No currency detected";
+    final confidence = (json['confidence'] ?? 0.0).toDouble();
+
+    setState(() {
+      lastResult = message;
+      lastConfidence = confidence;
+    });
+
+    await speak(message);
+
+  } catch (e) {
+    debugPrint("❌ Error: $e");
+    setState(() => _showCamera = false);
+    await _cameraController?.dispose();
+    _cameraController = null;
+    await speak("Scanning failed. Please try again.");
+  } finally {
+    if (mounted) setState(() { _isScanning = false; });
+  }
+}*/
   Future<void> scanCurrency() async {
     if (_isScanning) {
       await speak("Already scanning, please wait");
       return;
     }
     setState(() { _isScanning = true; });
+
     try {
-      await speak("Scanning currency note");
-      final XFile? image = await picker.pickImage(
-        source: ImageSource.camera,
-        maxWidth: modelInputSize * 2,
-        maxHeight: modelInputSize * 2,
-        imageQuality: 90,
+      await speak("Hold note steady");
+
+      // Open camera screen with countdown
+      final XFile? image = await Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => const CameraCountdownScreen(),
+        ),
       );
+
       if (image == null) {
+        await speak("Cancelled");
         setState(() { _isScanning = false; });
         return;
       }
-      final result = await predictCurrency(File(image.path));
+
+      await speak("Processing");
+
+      // Send to FastAPI
+      final request = http.MultipartRequest(
+        'POST',
+        Uri.parse(apiUrl),
+      );
+      request.files.add(
+        await http.MultipartFile.fromPath('file', image.path)
+      );
+
+      final response = await request.send().timeout(
+        const Duration(seconds: 15),
+        onTimeout: () => throw Exception("Server timeout"),
+      );
+
+      final body = await response.stream.bytesToString();
+      final json = jsonDecode(body);
+
+      final message    = json['message']    ?? "No currency detected";
+      final confidence = (json['confidence'] ?? 0.0).toDouble();
+
       setState(() {
-        lastResult = result.message;
-        lastConfidence = result.confidence;
+        lastResult = message;
+        lastConfidence = confidence;
       });
-      await speak(result.message);
-      debugPrint("✅ Detection: ${result.message} (${(result.confidence * 100).toStringAsFixed(1)}%)");
+
+      await speak(message);
+
     } catch (e) {
-      debugPrint("❌ Scan error: $e");
-      await speak("Scanning failed, please try again");
+      debugPrint("❌ Error: $e");
+      await speak("Scanning failed. Please try again.");
     } finally {
       if (mounted) setState(() { _isScanning = false; });
     }
   }
-
   // ==================== PREDICT ====================
   Future<DetectionResult> predictCurrency(File imageFile) async {
     if (interpreter == null) {
@@ -355,7 +502,7 @@ class _CurrencyHomeState extends State<CurrencyHome> {
       //    score = pred[4 + c]  →  output[(4+c) * numPredictions + i]
       double bestConfidence = 0.0;
       int bestClassIndex = -1;
-      const double detectionThreshold = 0.2; // same as Python: if conf > 0.2
+      const double detectionThreshold = 0.92; // same as Python: if conf > 0.92
 
       for (int i = 0; i < numPredictions; i++) {
         double maxScore = 0.0;
